@@ -1,0 +1,127 @@
+name: security-pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"   # weekly: new CVEs get published against dependencies that haven't changed
+  workflow_dispatch:
+
+# Least privilege: jobs can read the code and nothing else.
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+
+  sast-bandit:
+    name: SAST (Bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install "bandit>=1.8"
+      # Fails the job on any finding. Exceptions must be justified inline with "# nosec <id>".
+      - run: bandit -r app
+
+  dependency-audit:
+    name: SCA (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install "pip-audit>=2.7"
+      # Checks pinned versions against the PyPI/OSV advisory databases; exits 1 on a known vulnerability.
+      - run: pip-audit -r requirements.txt --desc
+
+  secret-scan:
+    name: Secrets (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history: a secret deleted later is still exposed in old commits
+      - name: Install gitleaks (pinned version)
+        run: |
+          curl -sSfL -o gitleaks.tgz https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz
+          tar -xzf gitleaks.tgz gitleaks
+      - run: ./gitleaks detect --source . --redact --no-banner -v
+
+  dast-zap-baseline:
+    name: DAST (ZAP baseline)
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    env:
+      TARGET: http://127.0.0.1:5000
+      # Pinned commit of my toolkit, used only to summarise the ZAP report.
+      TOOLKIT_SHA: 08c8c73e76935054f78842f44b5ae6e9e11f0b7c
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt
+
+      - name: Start the app inside the runner (the only scan target)
+        run: |
+          NOTES_DB=/tmp/notes.db nohup python -m app.main > app.log 2>&1 &
+          for i in $(seq 1 30); do curl -fsS "$TARGET/health" && exit 0; sleep 1; done
+          cat app.log; exit 1
+
+      - name: Seed one note so the scan sees real responses
+        run: |
+          curl -fsS -X POST -H "Content-Type: application/json" \
+            -d '{"title":"seed","body":"created by CI"}' "$TARGET/notes"
+
+      - name: Run ZAP baseline (passive scan)
+        id: zap
+        run: |
+          mkdir -p zap-out && chmod 777 zap-out   # the ZAP container runs as a different user
+          cp zap/rules.tsv zap-out/rules.tsv
+          status=0
+          docker run --rm --network host -v "$PWD/zap-out:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t "$TARGET/notes" -c rules.tsv -J zap-report.json -r zap-report.html -I \
+            || status=$?
+          # 0 = pass, 1 = a FAIL rule triggered, 2 = warnings (ignored via -I), 3 = ZAP error
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Summarise with authorised-security-assessment-toolkit
+        if: always() && hashFiles('zap-out/zap-report.json') != ''
+        run: |
+          git init -q toolkit
+          git -C toolkit fetch -q --depth 1 https://github.com/EverSoftLegit/authorised-security-assessment-toolkit "$TOOLKIT_SHA"
+          git -C toolkit checkout -q FETCH_HEAD
+          python toolkit/scripts/06_zap_json_analyzer.py zap-out/zap-report.json --output zap-out/zap-analysis.json
+          python toolkit/scripts/07_report_builder.py zap-out/zap-analysis.json \
+            --assessment "ZAP baseline scan (CI)" --client "devsecops-pipeline-demo, app running in the CI runner" \
+            --output zap-out/zap-summary.md
+          cat zap-out/zap-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload ZAP reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-reports
+          path: |
+            zap-out/zap-report.*
+            zap-out/zap-analysis.json
+            zap-out/zap-summary.md
+          if-no-files-found: ignore
+
+      - name: Fail if a FAIL rule triggered or ZAP errored
+        run: |
+          echo "ZAP exit status: ${{ steps.zap.outputs.status }}"
+          test "${{ steps.zap.outputs.status }}" = "0"
